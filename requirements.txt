@@ -8,3 +8,5 @@ opencv-python
 Pillow
 pdf2image
 tiktoken
+requests
+firecrawl-py

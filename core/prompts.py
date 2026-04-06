@@ -146,3 +146,27 @@ Always return your output as a **valid JSON object** in this exact format:
 }}
 '''
 
+
+authorship_verification_system_prompt = '''
+You are an expert in stylometry and authorship analysis. The user will give you two texts and a detailed task.
+After you complete the task step by step, you MUST respond with ONLY a valid JSON object (no markdown fences) with exactly these keys:
+- "av_score": a number from 0 to 1 inclusive (0 = low confidence same author, 1 = high confidence same author)
+- "av_reason": a concise string summarizing the main evidence for the score
+'''
+
+
+authorship_verification_user_prompt = '''
+Task: On a scale of 0 to 1, with 0 indicating low confidence and 1 indicating high confidence, please provide a general assessment of the likelihood that Text 1 and Text 2 were written by the same author. Your answer should reflect a moderate level of strictness in scoring. Here are some relevant variables to this problem.
+1. punctuation style(e.g. hyphen, brackets, colon, comma, parenthesis, quotation mark)
+2. special characters style, capitalization style(e.g. Continuous capitalization, capitalizing certain words)
+3. acronyms and abbreviations(e.g. Usage of acronyms such as OMG, Abbreviations without punctuation marks such as Mr Rochester vs. Mr. Rochester,Unusual abbreviations such as def vs. definitely)
+4. writing style
+5. expressions and idioms
+6. tone and mood
+7. sentence structure
+8. any other relevant aspect
+First step: Understand the problem, extracting relevant variables and devise a plan to solve the problem. Then, carry out the plan and solve the problem step by step. Finally, show the confidence score.
+Text 1: {texta}
+Text 2: {textb}
+'''
+
