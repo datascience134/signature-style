@@ -16,11 +16,32 @@ from core.llm_helper import LLMInterface
 from firecrawl import Firecrawl
 from firecrawl.v2.types import ScrapeOptions
 
+
+def _strip_outer_quotes(s):
+    """Remove matching ASCII double quotes from both ends (handles repeated wrappers)."""
+    s = (s or "").strip()
+    while len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1].strip()
+    return s
+
+
+def _normalize_extracted_keywords_payload(processed):
+    """Normalize LLM extraction: keyword strings must not start/end with ASCII \"."""
+    if isinstance(processed, dict) and "keywords" in processed:
+        inner = processed.get("keywords")
+        if isinstance(inner, (list, tuple)):
+            return {**processed, "keywords": _unique_keywords_preserve(inner)}
+        return processed
+    if isinstance(processed, list):
+        return _unique_keywords_preserve(processed)
+    return processed
+
+
 def _unique_keywords_preserve(items):
     seen = set()
     out = []
     for x in items:
-        x = (x or "").strip()
+        x = _strip_outer_quotes((x or "").strip())
         if not x:
             continue
         key = x.lower()
@@ -45,16 +66,18 @@ def _keywords_to_text(kw):
     if kw is None:
         return ""
     if isinstance(kw, str):
-        return kw.strip()
+        return _strip_outer_quotes(kw.strip())
     if isinstance(kw, dict):
         inner = kw.get("keywords")
         if isinstance(inner, (list, tuple)):
-            return "\n".join(str(k).strip() for k in inner if str(k).strip())
+            parts = [_strip_outer_quotes(str(k).strip()) for k in inner]
+            return "\n".join(p for p in parts if p)
         if isinstance(inner, str) and inner.strip():
-            return inner.strip()
+            return _strip_outer_quotes(inner.strip())
     if isinstance(kw, (list, tuple)):
-        return "\n".join(str(k).strip() for k in kw if str(k).strip())
-    return str(kw).strip()
+        parts = [_strip_outer_quotes(str(k).strip()) for k in kw]
+        return "\n".join(p for p in parts if p)
+    return _strip_outer_quotes(str(kw).strip())
 
 
 def _current_keywords_from_session():
@@ -280,7 +303,7 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
         return
 
     st.divider()
-    st.subheader("Refine keywords & search online")
+    st.subheader("Choose keywords to search online")
     st.caption(
         "Edit base keywords, optionally combine them in pairs, and append extra text to every query."
     )
@@ -289,23 +312,23 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
         st.session_state["keywords_editable"] = ""
 
     st.checkbox(
-        "Copy extracted keywords into the keyword box below",
+        "Copy all",
         key="prefill_keywords_editable",
         help="When checked, fills the box from your last extraction. Uncheck to clear the box. If left checked, a new extraction updates the box.",
         on_change=_keywords_prefill_checkbox_changed,
     )
 
     st.text_area(
-        "Keywords (one per line; add or remove freely)",
+        "Keywords (one per line)",
         height=150,
         key="keywords_editable",
     )
 
     st.text_area(
-        "Append to each search query (optional; not combined with keywords above — added at the end only)",
+        "Append to each search query (optional)",
         height=80,
         key="extra_keywords_search",
-        placeholder="e.g. site:reddit.com or a nickname (appended after each combo)",
+        placeholder="e.g. constraints like site:reddit.com or 'singapore'",
     )
 
     base_words = _parse_keyword_lines(st.session_state.get("keywords_editable", ""))
@@ -313,16 +336,16 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
 
     if not base_words:
         st.warning(
-            "Add at least one keyword in the main box, or check the box above to load keywords from your last extraction."
+            "Add at least one keyword"
         )
     else:
         combine_pairs = st.checkbox(
-            "Combine keywords in pairs (unordered pairs of the lines above; otherwise one query per line)",
+            "Combine keywords in pairs",
             value=False,
             key="combine_keywords_pairs",
         )
 
-        if st.button("Preview queries", key="preview_keyword_queries"):
+        if st.button("See search terms", key="preview_keyword_queries"):
             preview = _build_search_queries(base_words, combine_pairs, suffix_tokens)
             st.session_state["last_query_preview"] = preview
 
@@ -331,22 +354,23 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                 st.write(f"{i}. {q}")
 
             st.divider()
-            st.caption("Firecrawl uses the preview queries above (from **Preview queries**).")
+            st.subheader("Search online")
+            
             fc_limit = st.number_input(
-                "Firecrawl: max results per query",
+                "Number of search results taken per search term",
                 min_value=1,
                 max_value=50,
                 value=5,
                 key="firecrawl_search_limit",
                 help="How many web results to request for each preview line.",
             )
-            if st.button("Search previews with Firecrawl & save CSV", key="firecrawl_run_preview"):
+            if st.button("Search", key="firecrawl_run_preview"):
                 api_key = constants.FIRECRAWL_API_KEY
                 if not api_key:
                     st.error("Add FIRECRAWL_API_KEY to .streamlit/secrets.toml.")
                 else:
                     preview = list(st.session_state["last_query_preview"])
-                    with st.spinner("Searching with Firecrawl (search + markdown)…"):
+                    with st.spinner("Searching with Firecrawl..."):
                         rows = _firecrawl_preview_search_to_rows(
                             preview, int(fc_limit), api_key
                         )
@@ -380,7 +404,7 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                 df_fc = df_cached
                 out_path = st.session_state.get("firecrawl_csv_out_path") or ""
                 out_name = st.session_state.get("firecrawl_csv_out_name") or "firecrawl_search.csv"
-                st.success(f"Last Firecrawl run: {len(df_fc)} row(s) — saved to `{out_path}`")
+                st.success(f"Done! {len(df_fc)} row(s) — saved to `{out_path}`")
                 fc_event = st.dataframe(
                     df_fc,
                     use_container_width=True,
@@ -400,11 +424,11 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                     )
                 else:
                     st.caption(
-                        "Select rows with the checkboxes, then run authorship verification."
+                        "Select rows to verify if they are written by the same author as the original text."
                     )
                 can_av = bool(sel_rows and text_a)
                 if st.button(
-                    "Run authorship verification on selected rows",
+                    "Run authorship verification",
                     key="firecrawl_av_run",
                     disabled=not can_av,
                 ):
@@ -435,7 +459,7 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                     "utf-8-sig"
                 )
                 st.download_button(
-                    label="Download Firecrawl CSV (full)",
+                    label="Download search results (full)",
                     data=csv_bytes,
                     file_name=out_name,
                     mime="text/csv",
@@ -453,7 +477,7 @@ def extract_keywords(llm: LLMInterface, article: str, num_keywords: int):
         processing_prompt=prompts.process_into_list_prompt, 
         response_content=keywords_raw
     )
-    return keywords_processed
+    return _normalize_extracted_keywords_payload(keywords_processed)
 
 def ideate_websites(llm: LLMInterface, article: str, keywords_processed: list):
     keywords_str = ", ".join(keywords_processed)
