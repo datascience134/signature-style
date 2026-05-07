@@ -1,11 +1,11 @@
 import re
 import json
 import itertools
+from datetime import datetime
 from typing import Tuple
 import streamlit as st
 import pandas as pd
 import os
-import uuid
 from core import constants
 from core import prompts
 from core.llm_helper import LLMInterface
@@ -370,7 +370,7 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                         ]
                         cache_dir = os.path.join(os.getcwd(), ".streamlit_cache", "firecrawl")
                         os.makedirs(cache_dir, exist_ok=True)
-                        out_name = f"firecrawl_search_{uuid.uuid4().hex[:12]}.csv"
+                        out_name = f"search_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
                         out_path = os.path.join(cache_dir, out_name)
                         df_fc.to_csv(out_path, index=False, encoding="utf-8-sig")
                         st.session_state["firecrawl_results_df"] = df_fc
@@ -427,23 +427,33 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                     df_av = df_av[base_cols + extra]
                     st.session_state["firecrawl_av_results_df"] = df_av
 
-                if st.session_state.get("firecrawl_av_results_df") is not None:
-                    st.subheader("Authorship verification results")
-                    st.dataframe(
-                        st.session_state["firecrawl_av_results_df"],
-                        use_container_width=True,
-                    )
-
                 csv_bytes = df_fc.to_csv(index=False, encoding="utf-8-sig").encode(
                     "utf-8-sig"
                 )
                 st.download_button(
-                    label="Download search results (full)",
+                    label="Download all search results",
                     data=csv_bytes,
                     file_name=out_name,
                     mime="text/csv",
                     key="firecrawl_csv_download",
                 )
+
+                if st.session_state.get("firecrawl_av_results_df") is not None:
+                    st.subheader("Authorship verification results")
+                    df_av_display = st.session_state["firecrawl_av_results_df"]
+                    st.dataframe(
+                        df_av_display,
+                        use_container_width=True,
+                    )
+                    av_csv_bytes = df_av_display.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                    av_out_name = f"av_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    st.download_button(
+                        label="Download authorship verification results",
+                        data=av_csv_bytes,
+                        file_name=av_out_name,
+                        mime="text/csv",
+                        key="firecrawl_av_csv_download",
+                    )
 
 
 def extract_keywords(llm: LLMInterface, article: str, num_keywords: int):
