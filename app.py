@@ -3,7 +3,7 @@ import streamlit as st
 from core.helper import extract_from_text, keyword_combo_and_search_ui
 from core import llm_helper
 
-st.title('✒️ Signature Writing style')
+st.title('✒️ Keyword Crawler')
 
 st.markdown('''
     Extract signature keywords from a writer’s style — :rainbow[slang, quirks, niche phrases] — to help you trace their work across the web.

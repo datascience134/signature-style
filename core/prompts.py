@@ -36,6 +36,51 @@ Return a valid JSON object in the following format:
 ARTICLE:
 '''
 
+chi_keyword_extraction_prompt = '''
+  你是一名开源情报调查专家。
+
+  你的任务是从下面的文本中提取独特的作者行文指纹——那些不寻常或具有辨识度的关键词和简短短语，能够帮助通过网络搜索定位同一作者的其他文章。
+
+  请严格返回 {num_keywords} 个简短（1–3 字）且具有作者个性或典型风格的词语。
+
+  优先提取：
+
+  口语化表达、俚语、方言词（如中文方言、网络黑话、地缘特色用语）
+
+  带有情绪色彩或主观判断的词汇
+
+  作者反复使用的独特比喻、小众短语
+
+  罕见的成语、自创表达或非常规搭配
+
+  特定地区或亚文化圈内的缩略词、人名或指代
+
+  避免提取：
+
+  专业术语或行业行话（例如“GDP增长率”、“新自由主义”），除非用法非常独特
+
+  在维基百科或学术网站上常见的概念或词汇
+
+  泛泛而谈、情感中立的通用词
+
+  完整句子或解释说明
+
+  思考逻辑：这个作者说的什么话，很少会有其他人这样说？
+
+  输出格式：
+  返回一个合法的 JSON 对象，格式如下：
+
+  {{
+  "keywords": [
+  "关键词1",
+  "关键词2",
+  "关键词3"
+  ]
+  }}
+
+  文章内容如下：
+'''
+
 
 process_into_list_prompt = '''
 You will be given a string that contains a list of items. The list may include newline characters, bullet points (e.g. `-` or `•`), or inconsistent spacing.
@@ -44,7 +89,7 @@ Your task is to extract and return a clean **Python list** of strings, with each
 
 Return only valid JSON output. For example, given the input:
 
-'- abc  \n - def ghi'
+"- abc  \n - def ghi"
 
 Return:
 ["abc", "def ghi"]
@@ -53,99 +98,22 @@ Input string:
 {{input_string}}
 '''
 
+chi_process_into_list_prompt = '''
+你将收到一个包含列表项的字符串。该列表可能包含换行符、项目符号（例如 `-` 或 `•`）或不一致的空格。
 
-website_ideation_sys_prompt = '''
-You are a digital OSINT analyst.
+你的任务是从中提取并返回一个干净的 **Python 列表**，其中每个元素都是字符串，
+并且要去除任何项目符号和前后空白字符。
 
-Given an article and a list of keywords that reflect the author's unique style or language, your task is to suggest relevant websites or platforms where searching these keywords might help find **more writings by the same author**.
+只返回合法的 JSON 输出。例如，给定输入：
 
-Output format:
-Return a valid JSON object in the following format:
+"- 苹果 \n - 香蕉"
 
-{{
-  "sites": [
-    "site:reddit.com",
-    "site:medium.com",
-    "site:twitter.com"
-  ]
-}}
+应返回：
+["苹果", "香蕉"]
 
-Focus on:
-- Blogs, personal domains, and writing platforms (e.g., Medium, Wordpress, Substack)
-- Forums and community sites (e.g., Reddit, HardwareZone)
-- Social platforms (e.g., Twitter/X, Facebook)
-- Niche communities depending on the article content
-
-Do not explain. Just return the JSON object.
+输入字符串：
+{{input_string}}
 '''
-
-
-website_ideation_prompt = '''
-ARTICLE:
-
-{article}
-
-KEYWORDS:
-
-{keyword_list}
-'''
-
-author_checker_prompt = '''
-You are an assistant helping verify whether a person authored any content in a screenshot.
-
-Target author: "{author}"
-
-Follow these steps:
-
-1. Read the image text carefully.
-2. Check if "{author}" appears **exactly** as the author of any content — such as:
-   - A visible username or handle next to a post
-   - A byline, reply tag, or attribution explicitly showing authorship
-
-3. Do **not** guess or infer based on similar names. Only confirm if it **exactly matches** "{author}".
-
-Return only:
-- "yes" — if "{author}" is clearly shown as an author
-- "no" — if not
-
-No extra explanation.
-'''
-
-
-
-author_content_extraction_prompt = '''
-You are a data extraction assistant helping an OSINT analyst identify and structure content written by a specific individual from a screenshot containing text.
-
-Your goal is to extract only the content explicitly authored by the person named "{author}". The text may come from forums, blogs, social media, comment sections, or other platforms.
-
-Follow these steps carefully:
-
-1. **Check if the name "{author}" appears anywhere in the text** — as a username, handle, author tag, or attribution label. Do not infer or assume — only proceed if there is clear textual evidence of this name.
-
-2. If "{author}" is found, identify all the text **directly attributed** to them. This may include:
-   - Posts or comments where "{author}" is clearly shown as the author
-   - Replies or messages labeled as coming from "{author}"
-
-3. Extract only their content, **excluding anything written by others**.
-
-4. If no content from "{author}" is found, return an **empty list**.
-
-Always return your output as a **valid JSON object** in this exact format:
-
-**If content is found:**
-{{
-  "content": [
-    "First piece of content written by {author}.",
-    "Second piece of content written by {author}."
-  ]
-}}
-
-**If no content is found:**
-{{
-  "content": []
-}}
-'''
-
 
 authorship_verification_system_prompt = '''
 You are an expert in stylometry and authorship analysis. The user will give you two texts and a detailed task.
@@ -154,6 +122,13 @@ After you complete the task step by step, you MUST respond with ONLY a valid JSO
 - "av_reason": a concise string summarizing the main evidence for the score
 '''
 
+chi_authorship_verification_system_prompt = '''
+你是一名笔体学与作者身份分析专家。用户会给你两段文本以及一个详细的任务说明。
+
+在你按步骤完成任务后，你必须只返回一个合法的 JSON 对象（不要使用 markdown 代码块标记），该对象必须包含以下两个字段：
+- "av_score": 一个 0 到 1 之间的数字（包含 0 和 1），0 表示低置信度认为同一作者，1 表示高置信度认为同一作者
+- "av_reason": 一个简短的字符串，总结得出该分数的主要证据
+'''
 
 authorship_verification_user_prompt = '''
 Task: On a scale of 0 to 1, with 0 indicating low confidence and 1 indicating high confidence, please provide a general assessment of the likelihood that Text 1 and Text 2 were written by the same author. Your answer should reflect a moderate level of strictness in scoring. Here are some relevant variables to this problem.
@@ -170,3 +145,49 @@ Text 1: {texta}
 Text 2: {textb}
 '''
 
+chi_authorship_verification_user_prompt = '''
+任务：请在 0 到 1 的范围内，给出一个整体评估，判断文本一与文本二是否由同一作者所写。0 表示低置信度，1 表示高置信度。你的打分应体现适中的严格程度。以下是该任务中一些相关的分析维度：
+
+1. 标点风格（例如：破折号、括号、冒号、逗号、省略号、引号的使用习惯，全角/半角标点的偏好）
+2. 特殊字符与数字用法（例如：特殊符号的使用频率、数字格式偏好、中英文标点混用情况）
+3. 缩写与简称风格（例如：网络用语缩略如“然并卵”、“u1s1”，人名或机构名的习惯简称）
+4. 行文风格（例如：段落长短、口语化 vs 书面化程度、对话体 vs 叙事体）
+5. 表达方式与习语（例如：成语使用频率、方言词汇、固定搭配的习惯用法）
+6. 语气体裁（例如：讽刺、热情、冷静、调侃、批评等情感基调）
+7. 句式结构（例如：长短句交替习惯、排比句使用、倒装结构、“被”字句/“把”字句偏好）
+8. 重复用词或句式（例如：特定语气词“啊/哦/嗯”的使用、开头结尾的固定模式）
+
+第一步：理解问题，提取相关分析维度，并制定解决问题的计划。然后，执行计划，逐步分析。最后，给出置信度分数。
+
+文本一：{texta}
+文本二：{textb}
+'''
+
+article_extraction_system_prompt = """
+You are a content quality filter. Analyze this messy markdown scrape.
+
+TASKS:
+1. Determine if this is a real article/blog/post that matches the keywords.
+2. If YES: Extract the core article text. Remove all menus, ads, and footers.
+3. If NO (e.g., it's a login page, a list of unrelated links, or a '403 Forbidden' message): Identify why.
+
+Return ONLY a JSON object with these keys:
+{
+  "good_quality": boolean,
+  "output": "The cleaned article text if good_quality is true, otherwise the specific reason why it failed."
+}"""
+
+chi_article_extraction_system_prompt = """
+你是一名内容质量过滤器。请分析以下这份格式杂乱的 Markdown 抓取内容。
+
+任务：
+1. 判断这是否为一篇与关键词匹配的真实文章、博文或帖子。
+2. 如果是：提取核心文章正文。删除所有菜单、广告和页脚内容。
+3. 如果不是（例如：是登录页面、不相关的链接列表，或“403 Forbidden”等信息）：说明失败原因。
+
+只返回一个 JSON 对象，包含以下字段：
+{
+  "good_quality": true/false,
+  "output": "如果 good_quality 为 true，则输出清理后的文章正文；否则，输出具体的失败原因"
+}
+"""
