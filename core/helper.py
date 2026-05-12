@@ -141,26 +141,75 @@ def _firecrawl_item_url_markdown(item):
     return url, markdown
 
 
-def _firecrawl_preview_search_to_rows(preview_queries, limit, api_key):
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Return True if the exception looks like a 429 rate-limit or 402 payment-required response."""
+    msg = str(exc).lower()
+    return "429" in msg or "402" in msg or "rate limit" in msg or "too many requests" in msg or "payment required" in msg
+
+
+def _firecrawl_preview_search_to_rows(preview_queries, limit, api_keys):
     """
     For each preview query, run Firecrawl search with markdown scrape.
-    Returns rows: search_term, search_result_url, search_result_markdown.
+    On a 429 rate-limit error the next API key in api_keys is tried automatically.
+    Returns (rows, rate_limit_warnings) where rate_limit_warnings is a list of
+    human-readable strings describing any exhausted-key situations.
     """
-    app = Firecrawl(api_key=api_key)
+    if not api_keys:
+        return [], []
+
+    key_idx = 0
+    rate_limit_warnings = []
+
+    def _client():
+        return Firecrawl(api_key=api_keys[key_idx])
+
+    def _search_with_rotation(term, scrape_opts):
+        """Try every key until one succeeds or all hit 429."""
+        nonlocal key_idx
+        tried = 0
+        while tried < len(api_keys):
+            try:
+                return _client().search(term, limit=limit, scrape_options=scrape_opts), None
+            except Exception as e:
+                if _is_rate_limit_error(e) and key_idx < len(api_keys) - 1:
+                    key_idx += 1
+                    tried += 1
+                else:
+                    return None, e
+        return None, Exception("All API keys exhausted (rate limited)")
+
+    def _scrape_with_rotation(url):
+        """Try every key until one succeeds or all hit 429."""
+        nonlocal key_idx
+        tried = 0
+        while tried < len(api_keys):
+            try:
+                return _client().scrape(url, formats=["markdown"]), None
+            except Exception as e:
+                if _is_rate_limit_error(e) and key_idx < len(api_keys) - 1:
+                    key_idx += 1
+                    tried += 1
+                else:
+                    return None, e
+        return None, Exception("All API keys exhausted (rate limited)")
+
     rows = []
     scrape_opts = ScrapeOptions(formats=["markdown"])
     for term in preview_queries:
         term = (term or "").strip()
         if not term:
             continue
-        try:
-            result = app.search(term, limit=limit, scrape_options=scrape_opts)
-        except Exception as e:
+        result, err = _search_with_rotation(term, scrape_opts)
+        if err is not None:
+            if _is_rate_limit_error(err):
+                rate_limit_warnings.append(
+                    f'Rate limit hit on search for "{term}" — all API keys exhausted.'
+                )
             rows.append(
                 {
                     "search_term": term,
                     "search_result_url": "",
-                    "search_result_markdown": f"[search error] {e}",
+                    "search_result_markdown": f"[search error] {err}",
                 }
             )
             continue
@@ -177,11 +226,15 @@ def _firecrawl_preview_search_to_rows(preview_queries, limit, api_key):
         for item in web:
             url, markdown = _firecrawl_item_url_markdown(item)
             if url and not markdown:
-                try:
-                    doc = app.scrape(url, formats=["markdown"])
+                doc, scrape_err = _scrape_with_rotation(url)
+                if scrape_err is not None:
+                    if _is_rate_limit_error(scrape_err):
+                        rate_limit_warnings.append(
+                            f'Rate limit hit while scraping "{url}" — all API keys exhausted.'
+                        )
+                    markdown = f"[scrape error] {scrape_err}"
+                else:
                     markdown = getattr(doc, "markdown", None)
-                except Exception as e:
-                    markdown = f"[scrape error] {e}"
             rows.append(
                 {
                     "search_term": term,
@@ -189,7 +242,7 @@ def _firecrawl_preview_search_to_rows(preview_queries, limit, api_key):
                     "search_result_markdown": (markdown or "").strip(),
                 }
             )
-    return rows
+    return rows, rate_limit_warnings
 
 
 def process_search_result(llm: LLMInterface, messy_markdown: str, search_keywords: str):
@@ -344,15 +397,17 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                 help="How many web results to request for each preview line.",
             )
             if st.button("Search", key="firecrawl_run_preview"):
-                api_key = constants.FIRECRAWL_API_KEY
-                if not api_key:
-                    st.error("Add FIRECRAWL_API_KEY to .streamlit/secrets.toml.")
+                api_keys = constants.FIRECRAWL_API_KEY_LIST
+                if not api_keys:
+                    st.error("Add FIRECRAWL_API_KEY_LIST to .streamlit/secrets.toml.")
                 else:
                     preview = list(st.session_state["last_query_preview"])
                     with st.spinner("Searching with Firecrawl..."):
-                        rows = _firecrawl_preview_search_to_rows(
-                            preview, int(fc_limit), api_key
+                        rows, rl_warnings = _firecrawl_preview_search_to_rows(
+                            preview, int(fc_limit), api_keys
                         )
+                    for w in rl_warnings:
+                        st.warning(f"Rate limit exceeded: {w}")
                     with st.spinner("Processing markdown with LLM…"):
                         _enrich_firecrawl_rows_with_llm(llm, rows)
                     if not rows:
@@ -427,7 +482,8 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                     df_av = df_av[base_cols + extra]
                     st.session_state["firecrawl_av_results_df"] = df_av
 
-                csv_bytes = df_fc.to_csv(index=False, encoding="utf-8-sig").encode(
+                df_fc_dl = df_fc.drop(columns=["search_result_markdown"], errors="ignore")
+                csv_bytes = df_fc_dl.to_csv(index=False, encoding="utf-8-sig").encode(
                     "utf-8-sig"
                 )
                 st.download_button(
@@ -445,7 +501,7 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                         df_av_display,
                         use_container_width=True,
                     )
-                    av_csv_bytes = df_av_display.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                    av_csv_bytes = df_av_display.drop(columns=["search_result_markdown"], errors="ignore").to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
                     av_out_name = f"av_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
                     st.download_button(
                         label="Download authorship verification results",
