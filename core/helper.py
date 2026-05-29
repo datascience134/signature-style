@@ -1,4 +1,4 @@
-import re
+﻿import re
 import json
 import itertools
 import asyncio
@@ -11,7 +11,7 @@ import os
 from core import prompts
 from core.llm_helper import LLMInterface
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 
 def _strip_outer_quotes(s):
@@ -131,15 +131,29 @@ def _keywords_prefill_checkbox_changed():
 
 
 def _run_async(coro):
-    """Run async work from Streamlit's synchronous execution context."""
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
+    import threading
+    result = [None]
+    error = [None]
+
+    def run_in_thread():
+        loop = asyncio.ProactorEventLoop()  # Windows-compatible loop
+        asyncio.set_event_loop(loop)
         try:
-            return loop.run_until_complete(coro)
+            result[0] = loop.run_until_complete(coro)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            error[0] = e
         finally:
             loop.close()
+
+    thread = threading.Thread(target=run_in_thread)
+    thread.start()
+    thread.join()
+
+    if error[0] is not None:
+        raise error[0]
+    return result[0]
 
 
 def _ddg_search_urls(term: str, limit: int) -> list[str]:
@@ -166,14 +180,19 @@ async def _crawl_urls_markdown(urls: list[str]) -> dict:
 
     url_map = {}
     for r in results:
-        markdown = getattr(r, "markdown", None) or ""
-        if not isinstance(markdown, str):
-            raw_markdown = getattr(markdown, "raw_markdown", None)
-            markdown = raw_markdown if isinstance(raw_markdown, str) else str(markdown or "")
+        md_obj = getattr(r, "markdown", None)
+        if isinstance(md_obj, str):
+            content = md_obj
+        else:
+            content = (
+                getattr(md_obj, "fit_markdown", None)
+                or getattr(md_obj, "raw_markdown", None)
+                or ""
+            )
 
         url_map[getattr(r, "url", "")] = {
             "success": bool(getattr(r, "success", False)),
-            "markdown": markdown.strip(),
+            "markdown": content.strip(),  # keep key name "markdown" so downstream code doesn't break
             "error": str(getattr(r, "error_message", "") or ""),
         }
     return url_map
@@ -212,9 +231,15 @@ def _search_and_crawl_preview_to_rows(preview_queries, limit):
 
     unique_urls = list(dict.fromkeys(all_urls))
 
+    async def _do_crawl():
+        return await _crawl_urls_markdown(unique_urls)
+
     try:
-        crawl_map = _run_async(_crawl_urls_markdown(unique_urls))
+        crawl_map = _run_async(_do_crawl())
     except Exception as err:
+        import traceback
+        traceback.print_exc()  # full traceback to terminal
+        print(f"CRAWL ERROR: {err}")
         warnings.append(f"Crawl4AI batch crawl failed: {err}")
         crawl_map = {}
 

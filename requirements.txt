@@ -9,5 +9,5 @@ Pillow
 pdf2image
 tiktoken
 requests
-duckduckgo-search
+ddgs
 crawl4ai
