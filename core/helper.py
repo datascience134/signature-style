@@ -1,16 +1,17 @@
 import re
 import json
 import itertools
+import asyncio
+import time
 from datetime import datetime
 from typing import Tuple
 import streamlit as st
 import pandas as pd
 import os
-from core import constants
 from core import prompts
 from core.llm_helper import LLMInterface
-from firecrawl import Firecrawl
-from firecrawl.v2.types import ScrapeOptions
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+from duckduckgo_search import DDGS
 
 
 def _strip_outer_quotes(s):
@@ -129,120 +130,124 @@ def _keywords_prefill_checkbox_changed():
         st.session_state["keywords_editable"] = ""
 
 
-def _firecrawl_item_url_markdown(item):
-    """URL and markdown from a Firecrawl v2 search item (Document or SearchResultWeb)."""
-    markdown = getattr(item, "markdown", None)
-    meta = getattr(item, "metadata", None)
-    url = None
-    if meta is not None:
-        url = getattr(meta, "url", None) or getattr(meta, "source_url", None)
-    if not url:
-        url = getattr(item, "url", None)
-    return url, markdown
+def _run_async(coro):
+    """Run async work from Streamlit's synchronous execution context."""
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
-    """Return True if the exception looks like a 429 rate-limit or 402 payment-required response."""
-    msg = str(exc).lower()
-    return "429" in msg or "402" in msg or "rate limit" in msg or "too many requests" in msg or "payment required" in msg
+def _ddg_search_urls(term: str, limit: int) -> list[str]:
+    urls = []
+    with DDGS() as ddgs:
+        for item in ddgs.text(term, max_results=limit):
+            href = (item or {}).get("href")
+            if href:
+                urls.append(href)
+    return urls
 
 
-def _firecrawl_preview_search_to_rows(preview_queries, limit, api_keys):
+async def _crawl_urls_markdown(urls: list[str]) -> dict:
+    """Crawl deduplicated URLs in one batch and return URL -> crawl output."""
+    if not urls:
+        return {}
+
+    config = CrawlerRunConfig(
+        word_count_threshold=10,
+        remove_overlay_elements=True,
+    )
+    async with AsyncWebCrawler() as crawler:
+        results = await crawler.arun_many(urls, config=config)
+
+    url_map = {}
+    for r in results:
+        markdown = getattr(r, "markdown", None) or ""
+        if not isinstance(markdown, str):
+            raw_markdown = getattr(markdown, "raw_markdown", None)
+            markdown = raw_markdown if isinstance(raw_markdown, str) else str(markdown or "")
+
+        url_map[getattr(r, "url", "")] = {
+            "success": bool(getattr(r, "success", False)),
+            "markdown": markdown.strip(),
+            "error": str(getattr(r, "error_message", "") or ""),
+        }
+    return url_map
+
+
+def _search_and_crawl_preview_to_rows(preview_queries, limit):
     """
-    For each preview query, run Firecrawl search with markdown scrape.
-    On a 429 rate-limit error the next API key in api_keys is tried automatically.
-    Returns (rows, rate_limit_warnings) where rate_limit_warnings is a list of
-    human-readable strings describing any exhausted-key situations.
+    Search with DuckDuckGo, then crawl all URLs with one Crawl4AI arun_many batch.
+    Returns (rows, warnings) while preserving downstream row shape.
     """
-    if not api_keys:
-        return [], []
-
-    key_idx = 0
-    rate_limit_warnings = []
-
-    def _client():
-        return Firecrawl(api_key=api_keys[key_idx])
-
-    def _search_with_rotation(term, scrape_opts):
-        """Try every key until one succeeds or all hit 429."""
-        nonlocal key_idx
-        tried = 0
-        while tried < len(api_keys):
-            try:
-                return _client().search(term, limit=limit, scrape_options=scrape_opts), None
-            except Exception as e:
-                if _is_rate_limit_error(e) and key_idx < len(api_keys) - 1:
-                    key_idx += 1
-                    tried += 1
-                else:
-                    return None, e
-        return None, Exception("All API keys exhausted (rate limited)")
-
-    def _scrape_with_rotation(url):
-        """Try every key until one succeeds or all hit 429."""
-        nonlocal key_idx
-        tried = 0
-        while tried < len(api_keys):
-            try:
-                return _client().scrape(url, formats=["markdown"]), None
-            except Exception as e:
-                if _is_rate_limit_error(e) and key_idx < len(api_keys) - 1:
-                    key_idx += 1
-                    tried += 1
-                else:
-                    return None, e
-        return None, Exception("All API keys exhausted (rate limited)")
-
     rows = []
-    scrape_opts = ScrapeOptions(formats=["markdown"])
-    for term in preview_queries:
-        term = (term or "").strip()
-        if not term:
-            continue
-        result, err = _search_with_rotation(term, scrape_opts)
-        if err is not None:
-            if _is_rate_limit_error(err):
-                rate_limit_warnings.append(
-                    f'Rate limit hit on search for "{term}" — all API keys exhausted.'
-                )
+    warnings = []
+    term_to_urls = {}
+    all_urls = []
+    terms = [(t or "").strip() for t in preview_queries if (t or "").strip()]
+
+    for idx, term in enumerate(terms):
+        try:
+            urls = _ddg_search_urls(term, limit)
+        except Exception as err:
             rows.append(
                 {
                     "search_term": term,
                     "search_result_url": "",
                     "search_result_markdown": f"[search error] {err}",
+                    "success": False,
                 }
             )
             continue
-        web = getattr(result, "web", None) or []
-        if not web:
-            rows.append(
-                {
-                    "search_term": term,
-                    "search_result_url": "",
-                    "search_result_markdown": "",
-                }
-            )
+
+        term_to_urls[term] = urls
+        all_urls.extend(urls)
+
+        if len(terms) > 3 and idx < len(terms) - 1:
+            time.sleep(1)
+
+    unique_urls = list(dict.fromkeys(all_urls))
+
+    try:
+        crawl_map = _run_async(_crawl_urls_markdown(unique_urls))
+    except Exception as err:
+        warnings.append(f"Crawl4AI batch crawl failed: {err}")
+        crawl_map = {}
+
+    for term in terms:
+        urls = term_to_urls.get(term, [])
+        if not urls:
+            if not any(r.get("search_term") == term for r in rows):
+                rows.append(
+                    {
+                        "search_term": term,
+                        "search_result_url": "",
+                        "search_result_markdown": "",
+                        "success": False,
+                    }
+                )
             continue
-        for item in web:
-            url, markdown = _firecrawl_item_url_markdown(item)
-            if url and not markdown:
-                doc, scrape_err = _scrape_with_rotation(url)
-                if scrape_err is not None:
-                    if _is_rate_limit_error(scrape_err):
-                        rate_limit_warnings.append(
-                            f'Rate limit hit while scraping "{url}" — all API keys exhausted.'
-                        )
-                    markdown = f"[scrape error] {scrape_err}"
-                else:
-                    markdown = getattr(doc, "markdown", None)
+
+        for url in urls:
+            crawl = crawl_map.get(url, {})
+            success = bool(crawl.get("success", False))
+            markdown = (crawl.get("markdown", "") or "").strip()
+            if not success and crawl.get("error"):
+                warnings.append(f'Crawl failed for "{url}": {crawl.get("error")}')
             rows.append(
                 {
                     "search_term": term,
-                    "search_result_url": url or "",
-                    "search_result_markdown": (markdown or "").strip(),
+                    "search_result_url": url,
+                    "search_result_markdown": markdown if success else "",
+                    "success": success,
                 }
             )
-    return rows, rate_limit_warnings
+
+    return rows, warnings
 
 
 def process_search_result(llm: LLMInterface, messy_markdown: str, search_keywords: str):
@@ -280,7 +285,7 @@ MESSY MARKDOWN:
         return False, f"LLM Processing Error: {str(e)}"
 
 
-def _enrich_firecrawl_rows_with_llm(llm: LLMInterface, rows: list) -> None:
+def _enrich_search_rows_with_llm(llm: LLMInterface, rows: list) -> None:
     """Mutates each row dict with good_quality and llm_output from process_search_result."""
     for row in rows:
         md = row.get("search_result_markdown") or ""
@@ -393,68 +398,64 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                 min_value=1,
                 max_value=50,
                 value=5,
-                key="firecrawl_search_limit",
+                key="search_limit",
                 help="How many web results to request for each preview line.",
             )
-            if st.button("Search", key="firecrawl_run_preview"):
-                api_keys = constants.FIRECRAWL_API_KEY_LIST
-                if not api_keys:
-                    st.error("Add FIRECRAWL_API_KEY_LIST to .streamlit/secrets.toml.")
+            if st.button("Search", key="search_run_preview"):
+                preview = list(st.session_state["last_query_preview"])
+                with st.spinner("Searching with DuckDuckGo + Crawl4AI..."):
+                    rows, crawl_warnings = _search_and_crawl_preview_to_rows(
+                        preview, int(fc_limit)
+                    )
+                for w in crawl_warnings:
+                    st.warning(w)
+                with st.spinner("Processing markdown with LLM..."):
+                    _enrich_search_rows_with_llm(llm, rows)
+                if not rows:
+                    st.warning("No rows to write.")
+                    st.session_state.pop("search_results_df", None)
                 else:
-                    preview = list(st.session_state["last_query_preview"])
-                    with st.spinner("Searching with Firecrawl..."):
-                        rows, rl_warnings = _firecrawl_preview_search_to_rows(
-                            preview, int(fc_limit), api_keys
-                        )
-                    for w in rl_warnings:
-                        st.warning(f"Rate limit exceeded: {w}")
-                    with st.spinner("Processing markdown with LLM…"):
-                        _enrich_firecrawl_rows_with_llm(llm, rows)
-                    if not rows:
-                        st.warning("No rows to write.")
-                        st.session_state.pop("firecrawl_results_df", None)
-                    else:
-                        df_fc = pd.DataFrame(rows)[
-                            [
-                                "good_quality",
-                                "search_term",
-                                "search_result_url",
-                                "search_result_markdown",
-                                "llm_output",
-                            ]
+                    df_fc = pd.DataFrame(rows)[
+                        [
+                            "good_quality",
+                            "search_term",
+                            "search_result_url",
+                            "search_result_markdown",
+                            "llm_output",
                         ]
-                        cache_dir = os.path.join(os.getcwd(), ".streamlit_cache", "firecrawl")
-                        os.makedirs(cache_dir, exist_ok=True)
-                        out_name = f"search_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-                        out_path = os.path.join(cache_dir, out_name)
-                        df_fc.to_csv(out_path, index=False, encoding="utf-8-sig")
-                        st.session_state["firecrawl_results_df"] = df_fc
-                        st.session_state["firecrawl_csv_out_name"] = out_name
-                        st.session_state["firecrawl_csv_out_path"] = out_path
-                        st.session_state.pop("firecrawl_av_results_df", None)
+                    ]
+                    cache_dir = os.path.join(os.getcwd(), ".streamlit_cache", "crawl4ai")
+                    os.makedirs(cache_dir, exist_ok=True)
+                    out_name = f"search_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    out_path = os.path.join(cache_dir, out_name)
+                    df_fc.to_csv(out_path, index=False, encoding="utf-8-sig")
+                    st.session_state["search_results_df"] = df_fc
+                    st.session_state["search_csv_out_name"] = out_name
+                    st.session_state["search_csv_out_path"] = out_path
+                    st.session_state.pop("search_av_results_df", None)
 
-            df_cached = st.session_state.get("firecrawl_results_df")
+            df_cached = st.session_state.get("search_results_df")
             if df_cached is not None:
                 df_fc = df_cached
-                out_path = st.session_state.get("firecrawl_csv_out_path") or ""
-                out_name = st.session_state.get("firecrawl_csv_out_name") or "firecrawl_search.csv"
-                st.success(f"Done! {len(df_fc)} row(s) — saved to `{out_path}`")
+                out_path = st.session_state.get("search_csv_out_path") or ""
+                out_name = st.session_state.get("search_csv_out_name") or "search_results.csv"
+                st.success(f"Done! {len(df_fc)} row(s) - saved to `{out_path}`")
                 fc_event = st.dataframe(
                     df_fc,
                     use_container_width=True,
                     on_select="rerun",
                     selection_mode="multi-row",
-                    key="firecrawl_results_table",
+                    key="search_results_table",
                 )
                 sel_rows = list(fc_event.selection.rows)
                 text_a = (st.session_state.get("extract_article_text") or "").strip()
                 if not text_a:
                     st.warning(
-                        "Fill **Paste text here** (above) with the source article — it is used as Text 1 for authorship verification."
+                        "Fill **Paste text here** (above) with the source article - it is used as Text 1 for authorship verification."
                     )
                 elif sel_rows:
                     st.caption(
-                        f"**{len(sel_rows)}** row(s) selected — Text 2 for each row is **llm_output**."
+                        f"**{len(sel_rows)}** row(s) selected - Text 2 for each row is **llm_output**."
                     )
                 else:
                     st.caption(
@@ -463,11 +464,11 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                 can_av = bool(sel_rows and text_a)
                 if st.button(
                     "Run authorship verification",
-                    key="firecrawl_av_run",
+                    key="search_av_run",
                     disabled=not can_av,
                 ):
                     av_rows = []
-                    with st.spinner("Authorship verification (LLM)…"):
+                    with st.spinner("Authorship verification (LLM)..."):
                         for idx in sel_rows:
                             row = df_fc.iloc[int(idx)]
                             text_b = str(row.get("llm_output", "") or "")
@@ -480,7 +481,7 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                     base_cols = list(df_fc.columns)
                     extra = [c for c in ("av_score", "av_reason") if c not in base_cols]
                     df_av = df_av[base_cols + extra]
-                    st.session_state["firecrawl_av_results_df"] = df_av
+                    st.session_state["search_av_results_df"] = df_av
 
                 df_fc_dl = df_fc.drop(columns=["search_result_markdown"], errors="ignore")
                 csv_bytes = df_fc_dl.to_csv(index=False, encoding="utf-8-sig").encode(
@@ -491,12 +492,12 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                     data=csv_bytes,
                     file_name=out_name,
                     mime="text/csv",
-                    key="firecrawl_csv_download",
+                    key="search_csv_download",
                 )
 
-                if st.session_state.get("firecrawl_av_results_df") is not None:
+                if st.session_state.get("search_av_results_df") is not None:
                     st.subheader("Authorship verification results")
-                    df_av_display = st.session_state["firecrawl_av_results_df"]
+                    df_av_display = st.session_state["search_av_results_df"]
                     st.dataframe(
                         df_av_display,
                         use_container_width=True,
@@ -508,7 +509,7 @@ def keyword_combo_and_search_ui(llm: LLMInterface):
                         data=av_csv_bytes,
                         file_name=av_out_name,
                         mime="text/csv",
-                        key="firecrawl_av_csv_download",
+                        key="search_av_csv_download",
                     )
 
 
@@ -542,10 +543,10 @@ def extract_from_text(llm, text_input=None):
                 else:
                     st.session_state['keywords_editable'] = ""
                 st.session_state.pop('last_query_preview', None)
-                st.session_state.pop('firecrawl_results_df', None)
-                st.session_state.pop('firecrawl_av_results_df', None)
-                st.session_state.pop('firecrawl_csv_out_name', None)
-                st.session_state.pop('firecrawl_csv_out_path', None)
+                st.session_state.pop('search_results_df', None)
+                st.session_state.pop('search_av_results_df', None)
+                st.session_state.pop('search_csv_out_name', None)
+                st.session_state.pop('search_csv_out_path', None)
 
     if 'keywords' in st.session_state:
         st.subheader("Extracted keywords:")
